@@ -1,11 +1,10 @@
-version: "3.9"
 services:
     rabbitmq:
         image: rabbitmq:3.13-management
         container_name: orderlogix-rabbit
-        ports:
-            - "5672:5672"
-            - "15672:15672"
+        ports: ["5672:5672","15672:15672"]
         environment:
-            RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "-rabbit consumer_timeout 1800000"
+            RABBITMQ_DEFAULT_USER: appuser
+            RABBITMQ_DEFAULT_PASS: supersecret
+            RABBITMQ_DEFAULT_VHOST: /orderlogix
         restart: unless-stopped
