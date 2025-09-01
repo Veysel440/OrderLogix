@@ -2,9 +2,16 @@ services:
     rabbitmq:
         image: rabbitmq:3.13-management
         container_name: orderlogix-rabbit
-        ports: ["5672:5672","15672:15672"]
+        ports:
+            - "5672:5672"
+            - "5671:5671"
+            - "15672:15672"
+            - "15671:15671"
         environment:
             RABBITMQ_DEFAULT_USER: appuser
             RABBITMQ_DEFAULT_PASS: supersecret
             RABBITMQ_DEFAULT_VHOST: /orderlogix
+        volumes:
+            - ./ops/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+            - ./ops/rabbitmq/certs:/etc/rabbitmq/certs:ro
         restart: unless-stopped

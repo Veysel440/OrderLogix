@@ -9,35 +9,40 @@ use PhpAmqpLib\Wire\AMQPTable;
 class MqDeclarePayments extends Command
 {
     protected $signature = 'mq:declare:payments';
-    protected $description = 'Declare payments RPC topology';
+    protected $description = 'Declare exchanges/queues in /payments vhost';
 
     public function handle(): int
     {
-        $ex  = 'payments.x';
-        $dlx = 'payments.dlx';
-        $q   = 'payments.auth.q';
-        $dlq = 'payments.dlq';
-
-        $c = ConnectionFactory::connect();
+        $c = ConnectionFactory::connect('payments');
         $ch = $c->channel();
 
-        $ch->exchange_declare($ex,  'topic', false, true, false);
-        $ch->exchange_declare($dlx, 'topic', false, true, false);
+        $ch->exchange_declare('payments.x','topic',false,true,false);
+        $ch->exchange_declare('payments.dlx','topic',false,true,false);
 
-
-        $ch->queue_declare($q, false, true, false, false, false, new AMQPTable([
-            'x-queue-type' => 'quorum',
-            'x-dead-letter-exchange' => $dlx,
+        $ch->queue_declare('payments.auth.q', false, true, false, false, false, new AMQPTable([
+            'x-queue-type'=>'quorum',
+            'x-dead-letter-exchange'=>'payments.dlx',
         ]));
-        $ch->queue_bind($q, $ex, 'payment.authorize.request');
+        $ch->queue_bind('payments.auth.q','payments.x','payment.authorize');
 
-        $ch->queue_declare($dlq, false, true, false, false, false, new AMQPTable([
-            'x-queue-type' => 'quorum',
+        $ch->queue_declare('payments.failed.q', false, true, false, false, false, new AMQPTable([
+            'x-queue-type'=>'quorum',
         ]));
-        $ch->queue_bind($dlq, $dlx, 'payment.authorize.request.dlq');
+        $ch->queue_bind('payments.failed.q','payments.x','payment.failed');
 
+        $ch->queue_declare('payments.retry', false, true, false, false, false, new AMQPTable([
+            'x-queue-type'=>'classic',
+            'x-dead-letter-exchange'=>'payments.x',
+            'x-dead-letter-routing-key'=>'payment.authorize',
+        ]));
+
+        $ch->queue_declare('payments.auth.dlq', false, true, false, false, false, new AMQPTable([
+            'x-queue-type'=>'quorum',
+        ]));
+        $ch->queue_bind('payments.auth.dlq','payments.dlx','payment.authorize.dlq');
+
+        $this->info('payments vhost declared');
         $ch->close(); $c->close();
-        $this->info('payments topology declared.');
         return self::SUCCESS;
     }
 }

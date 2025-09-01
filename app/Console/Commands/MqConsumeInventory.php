@@ -7,6 +7,7 @@ use App\Models\Reservation;
 use App\Services\Rabbit\ConnectionFactory;
 use App\Services\Rabbit\Publisher;
 use App\Services\Rabbit\RetryHelper as RH;
+use App\Support\EventSchema;
 use App\Support\Telemetry;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
@@ -15,36 +16,51 @@ use PhpAmqpLib\Message\AMQPMessage;
 
 class MqConsumeInventory extends Command
 {
-    protected $signature = 'mq:consume:inventory';
+    protected $signature = 'mq:consume:inventory {--once}';
     protected $description = 'Consumes inventory.reserve, reserves stock with retries, emits inventory.reserved';
 
     public function handle(): int
     {
-        $q   = 'inventory.reserve.q';
-        $max = (int) env('INVENTORY_MAX_RETRY', 3);
+        $q        = env('INVENTORY_QUEUE', 'inventory.reserve.q');
+        $prefetch = (int) env('INVENTORY_PREFETCH', 16);
+        $max      = (int) env('INVENTORY_MAX_RETRY', 3);
+        $runOnce  = (bool) $this->option('once');
+        $stop     = false;
 
-        $c  = ConnectionFactory::connect();
+        if (function_exists('pcntl_signal')) {
+            pcntl_async_signals(true);
+            pcntl_signal(SIGTERM, fn() => $GLOBALS['__mq_stop'] = true);
+            pcntl_signal(SIGINT,  fn() => $GLOBALS['__mq_stop'] = true);
+        }
+
+        $c  = ConnectionFactory::connect('inventory');
         $ch = $c->channel();
-        $ch->basic_qos(null, 16, null);
+        $ch->basic_qos(null, $prefetch, null);
         $pub = new Publisher($ch);
 
-        $this->info("inventory listening on {$q}");
+        $this->info("inventory listening on {$q} (prefetch={$prefetch}, max-retry={$max})");
 
         $handleFail = function (AMQPMessage $m, \Throwable $e) use ($ch, $pub, $max) {
             $n = RH::retryCount($m);
             if ($n < $max) {
                 $props = array_merge($m->get_properties(), RH::withRetryHeaders($m, $n + 1));
                 $props['expiration'] = (string) RH::computeDelayMs($n); // ms
-                $retryMsg = new \PhpAmqpLib\Message\AMQPMessage($m->getBody(), $props);
+                $retryMsg = new AMQPMessage($m->getBody(), $props);
                 $ch->basic_publish($retryMsg, '', 'inventory.retry');
                 $this->line("retry[{$n}] delay={$props['expiration']}ms");
             } else {
+                $props = $m->get_properties();
+                $raw   = $m->getBody();
+                $enc   = $props['content_encoding'] ?? null;
+                if ($enc === 'gzip') { $raw = @gzdecode($raw) ?: $raw; }
+
                 $pub->publish('inventory.dlx', 'inventory.reserve.dlq', [
                     'type'        => 'inventory.reserve.failed',
+                    'v'           => 1,
                     'message_id'  => (string) Str::uuid(),
                     'occurred_at' => now()->toISOString(),
                     'error'       => substr($e->getMessage(), 0, 200),
-                    'payload'     => json_decode($m->getBody(), true),
+                    'data'        => json_decode($raw, true),
                 ]);
                 $this->line('→ sent to DLQ');
             }
@@ -54,7 +70,14 @@ class MqConsumeInventory extends Command
         $cb = function (AMQPMessage $m) use ($pub, $handleFail) {
             Telemetry::span('inventory.reserve.consume', function () use ($pub, $handleFail, $m) {
                 try {
-                    $payload = json_decode($m->getBody(), true, 512, JSON_INVALID_UTF8_SUBSTITUTE);
+                    $props = $m->get_properties();
+                    $raw   = $m->getBody();
+                    $enc   = $props['content_encoding'] ?? null;
+                    if ($enc === 'gzip') { $raw = @gzdecode($raw) ?: $raw; }
+
+                    $payload = json_decode($raw, true, 512, JSON_INVALID_UTF8_SUBSTITUTE);
+                    EventSchema::validate($payload);
+
                     $data = $payload['data'] ?? null;
                     if (!$data || empty($data['items'])) {
                         $this->line('skip: bad payload');
@@ -92,12 +115,14 @@ class MqConsumeInventory extends Command
                     $this->line("reserved: order_id=" . ($data['order_id'] ?? 'null') . " items=" . count($data['items']));
 
                     $pub->publish('inventory.x', 'inventory.reserved', [
-                        'message_id'  => (string) Str::uuid(),
                         'type'        => 'inventory.reserved',
+                        'v'           => 1,
+                        'message_id'  => (string) Str::uuid(),
                         'occurred_at' => now()->toISOString(),
                         'data'        => $data,
                     ], [
-                        'x-causation-id' => $mid,
+                        'x-causation-id'   => $mid,
+                        'x-correlation-id' => $data['order_id'] ?? $mid,
                     ]);
 
                     $this->line('→ published inventory.reserved');
@@ -113,7 +138,11 @@ class MqConsumeInventory extends Command
         };
 
         $ch->basic_consume($q, '', false, false, false, false, $cb);
-        while ($ch->is_consuming()) { $ch->wait(); }
+
+        do {
+            try { $ch->wait(null, false, 5); } catch (\PhpAmqpLib\Exception\AMQPTimeoutException) {}
+            $stop = $stop || !empty($GLOBALS['__mq_stop']);
+        } while (!$runOnce && !$stop && $ch->is_consuming());
 
         $ch->close(); $c->close();
         return self::SUCCESS;
