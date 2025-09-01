@@ -9,6 +9,7 @@ use App\Services\Rabbit\Publisher;
 use App\Services\Rabbit\RetryHelper as RH;
 use App\Support\EventSchema;
 use App\Support\Telemetry;
+use App\Support\Trace;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
@@ -45,14 +46,13 @@ class MqConsumeInventory extends Command
             if ($n < $max) {
                 $props = array_merge($m->get_properties(), RH::withRetryHeaders($m, $n + 1));
                 $props['expiration'] = (string) RH::computeDelayMs($n); // ms
-                $retryMsg = new AMQPMessage($m->getBody(), $props);
+                $retryMsg = new \PhpAmqpLib\Message\AMQPMessage($m->getBody(), $props);
                 $ch->basic_publish($retryMsg, '', 'inventory.retry');
                 $this->line("retry[{$n}] delay={$props['expiration']}ms");
             } else {
                 $props = $m->get_properties();
                 $raw   = $m->getBody();
-                $enc   = $props['content_encoding'] ?? null;
-                if ($enc === 'gzip') { $raw = @gzdecode($raw) ?: $raw; }
+                if (($props['content_encoding'] ?? null) === 'gzip') { $raw = @gzdecode($raw) ?: $raw; }
 
                 $pub->publish('inventory.dlx', 'inventory.reserve.dlq', [
                     'type'        => 'inventory.reserve.failed',
@@ -68,22 +68,19 @@ class MqConsumeInventory extends Command
         };
 
         $cb = function (AMQPMessage $m) use ($pub, $handleFail) {
-            Telemetry::span('inventory.reserve.consume', function () use ($pub, $handleFail, $m) {
+            $props = $m->get_properties();
+            $tpIn  = Trace::fromAmqpHeaders($props);
+
+            Telemetry::span('inventory.reserve.consume', function () use ($pub, $handleFail, $m, $props, $tpIn) {
                 try {
-                    $props = $m->get_properties();
-                    $raw   = $m->getBody();
-                    $enc   = $props['content_encoding'] ?? null;
-                    if ($enc === 'gzip') { $raw = @gzdecode($raw) ?: $raw; }
+                    $raw = $m->getBody();
+                    if (($props['content_encoding'] ?? null) === 'gzip') { $raw = @gzdecode($raw) ?: $raw; }
 
                     $payload = json_decode($raw, true, 512, JSON_INVALID_UTF8_SUBSTITUTE);
-                    EventSchema::validate($payload);
+                    EventSchema::validate($payload); // inventory.reserve@v
 
                     $data = $payload['data'] ?? null;
-                    if (!$data || empty($data['items'])) {
-                        $this->line('skip: bad payload');
-                        $m->ack();
-                        return;
-                    }
+                    if (!$data || empty($data['items'])) { $this->line('skip: bad payload'); $m->ack(); return; }
 
                     $mid = $payload['message_id'] ?? null;
                     if ($mid) {
@@ -114,16 +111,19 @@ class MqConsumeInventory extends Command
 
                     $this->line("reserved: order_id=" . ($data['order_id'] ?? 'null') . " items=" . count($data['items']));
 
+                    $headers = [
+                        'x-causation-id'   => $mid,
+                        'x-correlation-id' => $data['order_id'] ?? $mid,
+                    ];
+                    if ($tpIn) { $headers['traceparent'] = $tpIn; }
+
                     $pub->publish('inventory.x', 'inventory.reserved', [
                         'type'        => 'inventory.reserved',
                         'v'           => 1,
                         'message_id'  => (string) Str::uuid(),
                         'occurred_at' => now()->toISOString(),
                         'data'        => $data,
-                    ], [
-                        'x-causation-id'   => $mid,
-                        'x-correlation-id' => $data['order_id'] ?? $mid,
-                    ]);
+                    ], $headers);
 
                     $this->line('→ published inventory.reserved');
                     $m->ack();
@@ -134,6 +134,7 @@ class MqConsumeInventory extends Command
             }, [
                 'messaging.system'      => 'rabbitmq',
                 'messaging.destination' => 'inventory.reserve.q',
+                'traceparent'           => $tpIn,
             ]);
         };
 

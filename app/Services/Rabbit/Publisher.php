@@ -3,6 +3,7 @@
 namespace App\Services\Rabbit;
 
 use App\Support\EventSchema;
+use App\Support\Trace;
 use Illuminate\Support\Str;
 use PhpAmqpLib\Channel\AMQPChannel;
 use PhpAmqpLib\Message\AMQPMessage;
@@ -21,10 +22,8 @@ final class Publisher
         $this->ch->confirm_select();
         $this->confirms = true;
 
-        $this->ch->set_ack_handler(static function ($deliveryTag, $multiple) {
-        });
-        $this->ch->set_nack_handler(static function ($deliveryTag, $multiple, $requeue) {
-        });
+        $this->ch->set_ack_handler(static function ($deliveryTag, $multiple) {});
+        $this->ch->set_nack_handler(static function ($deliveryTag, $multiple, $requeue) {});
         $this->ch->set_return_listener(function ($replyCode, $replyText, $exchange, $routingKey, AMQPMessage $msg) {
             $this->lastReturn = [
                 'code' => $replyCode,
@@ -36,23 +35,17 @@ final class Publisher
         });
     }
 
-    /**
-     * @param array<string,mixed> $payload
-     * @param array<string,mixed> $headers
-     */
+    /** @param array<string,mixed> $payload @param array<string,mixed> $headers */
     public function publish(string $exchange, string $routingKey, array $payload, array $headers = []): void
     {
         $payload['type']        = $payload['type']        ?? $routingKey;
         $payload['v']           = $payload['v']           ?? 1;
         $payload['occurred_at'] = $payload['occurred_at'] ?? now()->toISOString();
         $payload['message_id']  = $payload['message_id']  ?? (string) Str::uuid();
-
         EventSchema::validate($payload);
 
         $body = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-        if ($body === false) {
-            throw new \RuntimeException('json encode failed');
-        }
+        if ($body === false) { throw new \RuntimeException('json encode failed'); }
 
         $props = [
             'content_type'  => 'application/json',
@@ -64,14 +57,13 @@ final class Publisher
         $threshold = (int) env('AMQP_COMPRESS_THRESHOLD', 100 * 1024);
         if (strlen($body) > $threshold) {
             $gz = gzencode($body, 6);
-            if ($gz !== false) {
-                $body = $gz;
-                $props['content_encoding'] = 'gzip';
-            }
+            if ($gz !== false) { $body = $gz; $props['content_encoding'] = 'gzip'; }
         }
 
-        $tp = request()?->header('traceparent');
-        if ($tp) { $headers['traceparent'] = $tp; }
+        $tp  = Trace::currentTraceparent();
+        $rid = Trace::currentRequestId();
+        if ($tp)  { $headers['traceparent'] = $tp; }
+        if ($rid) { $headers['x-request-id'] = $rid; }
         if (!empty($payload['data']['order_id'])) {
             $headers['x-order-id'] = (string) $payload['data']['order_id'];
         }
@@ -84,17 +76,11 @@ final class Publisher
 
         if ($this->confirms) {
             $timeout = (float) env('PUBLISH_CONFIRM_TIMEOUT', 3.0);
-            try {
-                $this->ch->wait_for_pending_acks_returns($timeout);
-            } catch (\Throwable $e) {
-                throw new \RuntimeException('publish confirm error: '.$e->getMessage(), previous: $e);
-            }
+            $this->ch->wait_for_pending_acks_returns($timeout);
         }
 
         if ($this->lastReturn !== null) {
-            throw new \RuntimeException(
-                sprintf('unroutable [%s→%s]: %s', $exchange, $routingKey, $this->lastReturn['text'] ?? 'return')
-            );
+            throw new \RuntimeException(sprintf('unroutable [%s→%s]: %s', $exchange, $routingKey, $this->lastReturn['text'] ?? 'return'));
         }
     }
 }

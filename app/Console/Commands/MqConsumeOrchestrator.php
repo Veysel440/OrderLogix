@@ -6,6 +6,7 @@ use App\Services\Rabbit\ConnectionFactory;
 use App\Services\Rabbit\Publisher;
 use App\Support\EventSchema;
 use App\Support\Telemetry;
+use App\Support\Trace;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
@@ -37,34 +38,27 @@ class MqConsumeOrchestrator extends Command
         $this->info("orchestrator listening on {$ordersQ} (prefetch={$prefetch})");
 
         $cb = function (AMQPMessage $msg) use ($pub) {
-            Telemetry::span('orchestrator.consume', function () use ($pub, $msg) {
-                $props = $msg->get_properties();
-                $raw   = $msg->getBody();
-                $enc   = $props['content_encoding'] ?? null;
-                if ($enc === 'gzip') { $raw = @gzdecode($raw) ?: $raw; }
+            $props = $msg->get_properties();
+            $tpIn  = Trace::fromAmqpHeaders($props);
+
+            Telemetry::span('orchestrator.consume', function () use ($pub, $msg, $props, $tpIn) {
+                $raw = $msg->getBody();
+                if (($props['content_encoding'] ?? null) === 'gzip') { $raw = @gzdecode($raw) ?: $raw; }
 
                 $payload = json_decode($raw, true, 512, JSON_INVALID_UTF8_SUBSTITUTE) ?? [];
-                EventSchema::validate($payload); // order.placed@v
+                EventSchema::validate($payload);
 
                 $messageId = $props['message_id'] ?? $payload['message_id'] ?? null;
                 $data      = $payload['data'] ?? [];
 
-                if (!$messageId || empty($data['items'])) {
-                    $this->line('skip: missing data');
-                    $msg->ack();
-                    return;
-                }
+                if (!$messageId || empty($data['items'])) { $this->line('skip: missing data'); $msg->ack(); return; }
 
                 $ins = DB::table('processed_messages')->insertOrIgnore([
                     'message_id'   => $messageId,
                     'consumer'     => 'orchestrator',
                     'processed_at' => now(),
                 ]);
-                if ($ins === 0) {
-                    $this->line("dup: {$messageId}");
-                    $msg->ack();
-                    return;
-                }
+                if ($ins === 0) { $this->line("dup: {$messageId}"); $msg->ack(); return; }
 
                 $this->line("order.placed consumed: order_id=" . ($data['order_id'] ?? 'null') . " items=" . count($data['items']));
 
@@ -79,10 +73,13 @@ class MqConsumeOrchestrator extends Command
                     ],
                 ];
 
-                $pub->publish('inventory.x', 'inventory.reserve', $inv, [
+                $headers = [
                     'x-causation-id'   => $messageId,
                     'x-correlation-id' => $data['order_id'] ?? $messageId,
-                ]);
+                ];
+                if ($tpIn) { $headers['traceparent'] = $tpIn; }
+
+                $pub->publish('inventory.x', 'inventory.reserve', $inv, $headers);
 
                 $this->line('→ published inventory.reserve');
                 $msg->ack();
@@ -90,6 +87,7 @@ class MqConsumeOrchestrator extends Command
                 'messaging.system'      => 'rabbitmq',
                 'messaging.operation'   => 'process',
                 'messaging.destination' => 'orders.q',
+                'traceparent'           => $tpIn,
             ]);
         };
 
