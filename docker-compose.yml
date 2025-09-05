@@ -3,10 +3,10 @@ services:
         image: rabbitmq:3.13-management
         container_name: orderlogix-rabbit
         ports:
-            - "5672:5672"
-            - "5671:5671"
-            - "15672:15672"
-            - "15671:15671"
+            - "5672:5672"    # AMQP (plain)
+            - "5671:5671"    # AMQP (TLS)
+            - "15672:15672"  # Mgmt (HTTP)
+            - "15671:15671"  # Mgmt (HTTPS/TLS)
         environment:
             RABBITMQ_DEFAULT_USER: appuser
             RABBITMQ_DEFAULT_PASS: supersecret
@@ -14,4 +14,12 @@ services:
         volumes:
             - ./ops/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
             - ./ops/rabbitmq/certs:/etc/rabbitmq/certs:ro
+        extra_hosts:
+            - "host.docker.internal:host-gateway"
+        healthcheck:
+            test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+            interval: 10s
+            timeout: 5s
+            retries: 5
+            start_period: 10s
         restart: unless-stopped

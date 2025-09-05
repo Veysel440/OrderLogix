@@ -16,10 +16,10 @@ final class ConnectionFactory
             default     => 'RABBITMQ_',
         };
 
-        $host   = env('RABBITMQ_HOST', '127.0.0.1');
-        $user   = env($prefix.'USER',     env('RABBITMQ_USER', 'guest'));
-        $pass   = env($prefix.'PASSWORD', env('RABBITMQ_PASSWORD', 'guest'));
-        $vhost  = env($prefix.'VHOST',    env('RABBITMQ_VHOST', '/'));
+        $host  = env('RABBITMQ_HOST', '127.0.0.1');
+        $user  = env($prefix.'USER',     env('RABBITMQ_USER', 'guest'));
+        $pass  = env($prefix.'PASSWORD', env('RABBITMQ_PASSWORD', 'guest'));
+        $vhost = env($prefix.'VHOST',    env('RABBITMQ_VHOST', '/'));
 
         $conn_to = (float) env('AMQP_CONN_TIMEOUT', 3.0);
         $rw_to   = (float) env('AMQP_RW_TIMEOUT', 3.0);
@@ -28,8 +28,8 @@ final class ConnectionFactory
         $useTls  = filter_var(env('AMQP_TLS', false), FILTER_VALIDATE_BOOLEAN);
 
         $clientProps = [
-            'connection_name' => sprintf('orderlogix:%s', $ctx),
-            'product' => 'orderlogix-app',
+            'connection_name' => "orderlogix:{$ctx}",
+            'product'         => 'orderlogix-app',
         ];
 
         if ($useTls) {
@@ -37,15 +37,14 @@ final class ConnectionFactory
             $verify = filter_var(env('AMQP_TLS_VERIFY', false), FILTER_VALIDATE_BOOLEAN);
 
             $sslOpts = [
-                'verify_peer'      => $verify,
-                'verify_peer_name' => $verify,
+                'verify_peer'       => $verify,
+                'verify_peer_name'  => $verify,
+                'allow_self_signed' => ! $verify,
             ];
-            if ($ca  = env('AMQP_TLS_CA'))   { $sslOpts['cafile']     = $ca; }
-            if ($crt = env('AMQP_TLS_CERT')) { $sslOpts['local_cert'] = $crt; }
-            if ($key = env('AMQP_TLS_KEY'))  { $sslOpts['local_pk']   = $key; }
-            if ($verify) {
-                $sslOpts['peer_name'] = env('AMQP_TLS_PEER_NAME', $host);
-            }
+            if ($ca  = env('AMQP_TLS_CA'))   $sslOpts['cafile']     = $ca;
+            if ($crt = env('AMQP_TLS_CERT')) $sslOpts['local_cert'] = $crt;
+            if ($key = env('AMQP_TLS_KEY'))  $sslOpts['local_pk']   = $key;
+            if ($verify) $sslOpts['peer_name'] = env('AMQP_TLS_PEER_NAME', $host);
 
             $options = [
                 'connection_timeout' => $conn_to,
@@ -59,14 +58,6 @@ final class ConnectionFactory
         }
 
         $port = (int) env('RABBITMQ_PORT', 5672);
-
-        $options = [
-            'connection_timeout' => $conn_to,
-            'read_write_timeout' => $rw_to,
-            'keepalive'          => $keep,
-            'heartbeat'          => $hb,
-            'client_properties'  => $clientProps,
-        ];
 
         return AMQPStreamConnection::create_connection([[
             'host'               => $host,

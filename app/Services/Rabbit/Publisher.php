@@ -18,20 +18,13 @@ final class Publisher
     public function __construct(AMQPChannel $ch)
     {
         $this->ch = $ch;
-
         $this->ch->confirm_select();
         $this->confirms = true;
 
-        $this->ch->set_ack_handler(static function ($deliveryTag, $multiple) {});
-        $this->ch->set_nack_handler(static function ($deliveryTag, $multiple, $requeue) {});
-        $this->ch->set_return_listener(function ($replyCode, $replyText, $exchange, $routingKey, AMQPMessage $msg) {
-            $this->lastReturn = [
-                'code' => $replyCode,
-                'text' => $replyText,
-                'x'    => $exchange,
-                'rk'   => $routingKey,
-                'body' => $msg->getBody(),
-            ];
+        $this->ch->set_ack_handler(static function ($tag, $multiple) {});
+        $this->ch->set_nack_handler(static function ($tag, $multiple, $requeue) {});
+        $this->ch->set_return_listener(function ($code, $text, $exchange, $rk, AMQPMessage $msg) {
+            $this->lastReturn = ['code'=>$code,'text'=>$text,'x'=>$exchange,'rk'=>$rk,'body'=>$msg->getBody()];
         });
     }
 
@@ -42,10 +35,11 @@ final class Publisher
         $payload['v']           = $payload['v']           ?? 1;
         $payload['occurred_at'] = $payload['occurred_at'] ?? now()->toISOString();
         $payload['message_id']  = $payload['message_id']  ?? (string) Str::uuid();
+
         EventSchema::validate($payload);
 
-        $body = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-        if ($body === false) { throw new \RuntimeException('json encode failed'); }
+        $body = json_encode($payload, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);
+        if ($body === false) throw new \RuntimeException('json encode failed');
 
         $props = [
             'content_type'  => 'application/json',
@@ -54,7 +48,7 @@ final class Publisher
             'type'          => $payload['type'],
         ];
 
-        $threshold = (int) env('AMQP_COMPRESS_THRESHOLD', 100 * 1024);
+        $threshold = (int) env('AMQP_COMPRESS_THRESHOLD', 100*1024);
         if (strlen($body) > $threshold) {
             $gz = gzencode($body, 6);
             if ($gz !== false) { $body = $gz; $props['content_encoding'] = 'gzip'; }
@@ -62,13 +56,12 @@ final class Publisher
 
         $tp  = Trace::currentTraceparent();
         $rid = Trace::currentRequestId();
-        if ($tp)  { $headers['traceparent'] = $tp; }
-        if ($rid) { $headers['x-request-id'] = $rid; }
-        if (!empty($payload['data']['order_id'])) {
-            $headers['x-order-id'] = (string) $payload['data']['order_id'];
-        }
-        $props['application_headers'] = new AMQPTable($headers);
+        if ($tp)  $headers['traceparent'] = $tp;
+        if ($rid) $headers['x-request-id'] = $rid;
+        $headers['x-event-type'] = $payload['type'];
+        if (!empty($payload['data']['order_id'])) $headers['x-order-id'] = (string) $payload['data']['order_id'];
 
+        $props['application_headers'] = new AMQPTable($headers);
         $msg = new AMQPMessage($body, $props);
 
         $this->lastReturn = null;
@@ -78,7 +71,6 @@ final class Publisher
             $timeout = (float) env('PUBLISH_CONFIRM_TIMEOUT', 3.0);
             $this->ch->wait_for_pending_acks_returns($timeout);
         }
-
         if ($this->lastReturn !== null) {
             throw new \RuntimeException(sprintf('unroutable [%s→%s]: %s', $exchange, $routingKey, $this->lastReturn['text'] ?? 'return'));
         }

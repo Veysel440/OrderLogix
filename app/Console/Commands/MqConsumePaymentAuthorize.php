@@ -2,74 +2,76 @@
 
 namespace App\Console\Commands;
 
-use App\Models\Order;
-use App\Models\Payment;
+use App\Support\Telemetry;
+use App\Support\Pulse;
+use App\Support\EventSchema;
 use App\Services\Rabbit\ConnectionFactory;
 use App\Services\Rabbit\Publisher;
-use App\Services\Rabbit\RpcClient;
 use Illuminate\Console\Command;
-use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use PhpAmqpLib\Message\AMQPMessage;
 
-class MqConsumePaymentAuthorize extends Command
+final class MqConsumePaymentAuthorize extends Command
 {
     protected $signature = 'mq:consume:payment-authorize';
-    protected $description = 'Consumes inventory.reserved, calls payments RPC, emits payment.authorized|failed';
+    protected $description = 'Consumes payment.authorize and emits payment.authorized or payment.failed';
 
     public function handle(): int
     {
-        $q = 'inventory.reserved.q';
-        $c = ConnectionFactory::connect();
+        $q = env('PAYMENTS_AUTH_QUEUE', 'payments.auth.q');
+        $prefetch = (int) env('PAYMENTS_PREFETCH', 16);
+
+        $c  = ConnectionFactory::connect('payments');
         $ch = $c->channel();
-        $ch->basic_qos(null, 8, null);
+        $ch->basic_qos(null, $prefetch, null);
         $pub = new Publisher($ch);
-        $rpc = new RpcClient($ch);
 
-        $ch->exchange_declare('inventory.x','topic',false,true,false);
-        $ch->queue_declare($q,false,true,false,false);
-        $ch->queue_bind($q,'inventory.x','inventory.reserved');
+        $this->info("payments ← {$q}");
 
-        $this->info("payment-authorize listening on {$q}");
+        $cb = function (AMQPMessage $m) use ($pub) {
+            Telemetry::span('payments.authorize.consume', function () use ($m, $pub) {
+                try {
+                    $raw = $m->getBody();
+                    $props = $m->get_properties();
+                    if (($props['content_encoding'] ?? null) === 'gzip') { $raw = @gzdecode($raw) ?: $raw; }
+                    $p = json_decode($raw, true, 512, JSON_INVALID_UTF8_SUBSTITUTE) ?? [];
 
-        $cb = function(AMQPMessage $m) use ($rpc,$pub) {
-            $ev = json_decode($m->getBody(), true) ?? [];
-            $data = $ev['data'] ?? [];
-            $orderId = $data['order_id'] ?? null;
-            if (!$orderId) { $m->ack(); return; }
+                    try { EventSchema::validate(['type'=>'payment.authorize','v'=>1,'occurred_at'=>now()->toISOString(),'data'=>$p['data']??[]]); } catch (\Throwable) {}
 
-            $order = Order::find($orderId);
-            if (!$order) { $m->ack(); return; }
+                    $data = $p['data'] ?? [];
+                    $orderId = $data['order_id'] ?? null;
+                    $ok = isset($data['amount']) && $data['amount'] > 0;
 
-            $resp = $rpc->callAuthorize(['order_id'=>$orderId,'amount'=>(float)$order->total,'currency'=>$order->currency], 5.0);
+                    $type = $ok ? 'payment.authorized' : 'payment.failed';
+                    $evt  = [
+                        'type'=>$type,'v'=>1,'message_id'=>(string) Str::uuid(),
+                        'occurred_at'=>now()->toISOString(),
+                        'data'=>['order_id'=>$orderId,'reason'=>$ok?null:'invalid_amount'],
+                    ];
 
-            DB::transaction(function() use ($resp,$order) {
-                $status = $resp['authorized'] ? 'AUTHORIZED' : 'FAILED';
-                Payment::create([
-                    'order_id' => $order->id,
-                    'amount'   => $order->total,
-                    'currency' => $order->currency,
-                    'status'   => $status,
-                    'provider' => $resp['provider'] ?? 'mock',
-                    'provider_ref' => $resp['auth_code'] ?? null,
-                    'meta' => $resp,
-                ]);
-            });
+                    try { EventSchema::validate($evt); } catch (\Throwable) {}
 
-            $type = $resp['authorized'] ? 'payment.authorized' : 'payment.failed';
-            $pub->publish('payments.x', $type, [
-                'message_id'  => (string) Str::uuid(),
-                'type'        => $type,
-                'occurred_at' => now()->toISOString(),
-                'data'        => ['order_id'=>$orderId, 'amount'=>(float)$order->total, 'currency'=>$order->currency],
-            ], ['x-causation-id' => $ev['message_id'] ?? null]);
-
-            $this->line("→ {$type} for order={$orderId}");
-            $m->ack();
+                    $pub->publish('payments.x', $type, $evt);
+                    Pulse::send('payments',$type,$ok?'ok':'err',['order_id'=>$orderId]);
+                } catch (\Throwable $e) {
+                    logger()->warning('payments.authorize error', ['err'=>$e->getMessage()]);
+                } finally {
+                    $m->ack();
+                }
+            }, ['messaging.system'=>'rabbitmq','messaging.destination'=>$q]);
         };
 
-        $ch->basic_consume($q,'',false,false,false,false,$cb);
-        while ($ch->is_consuming()) { $ch->wait(); }
+        $tag = $ch->basic_consume($q, 'payments', false, false, false, false, $cb);
+
+        $running = true;
+        if (\function_exists('pcntl_signal')) {
+            pcntl_async_signals(true);
+            pcntl_signal(SIGTERM, function() use (&$running, $ch, $tag) { $running = false; try { $ch->basic_cancel($tag); } catch (\Throwable) {} });
+            pcntl_signal(SIGINT,  function() use (&$running, $ch, $tag) { $running = false; try { $ch->basic_cancel($tag); } catch (\Throwable) {} });
+        }
+
+        while ($running && $ch->is_consuming()) { $ch->wait(null, true, 1); }
+
         $ch->close(); $c->close();
         return self::SUCCESS;
     }

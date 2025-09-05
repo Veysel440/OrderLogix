@@ -2,41 +2,50 @@
 
 namespace App\Console\Commands;
 
+use App\Support\Pulse;
 use App\Services\Rabbit\ConnectionFactory;
+use App\Services\Rabbit\Publisher;
 use Illuminate\Console\Command;
 use PhpAmqpLib\Message\AMQPMessage;
 
-class MqDlqSweepInventory extends Command
+final class MqDlqSweepInventory extends Command
 {
-    protected $signature = 'mq:dlq:inventory {action=requeue : requeue|park} {--limit=}';
-    protected $description = 'Sweep inventory DLQ: requeue to inventory.reserve or move to parking lot';
+    protected $signature = 'mq:dlq:sweep-inventory {--limit=1000} {--dry=0}';
+    protected $description = 'Moves messages from inventory.reserve.dlq → inventory.retry (classic)';
 
     public function handle(): int
     {
-        $action = $this->argument('action');
-        $limit  = (int) ($this->option('limit') ?? env('DLQ_SWEEP_LIMIT', 1000));
-        $dlq    = 'inventory.dlq';
+        $limit = (int) $this->option('limit');
+        $dry   = (bool) $this->option('dry');
 
-        $c = ConnectionFactory::connect();
+        $c  = ConnectionFactory::connect('inventory');
         $ch = $c->channel();
+        $pub= new Publisher($ch);
 
-        $count = 0;
-        for ($i = 0; $i < $limit; $i++) {
-            /** @var AMQPMessage|null $m */
-            $m = $ch->basic_get($dlq, false);
-            if (!$m) break;
+        $dlq = 'inventory.reserve.dlq';
+        $moved = 0;
 
-            if ($action === 'requeue') {
-                $ch->basic_publish(new AMQPMessage($m->getBody(), $m->get_properties()), 'inventory.x', 'inventory.reserve');
-            } else {
-                $ch->basic_publish(new AMQPMessage($m->getBody(), $m->get_properties()), 'inventory.parking.x', '');
+        $this->info("sweeping DLQ: {$dlq} limit={$limit} dry={$dry}");
+
+        for ($i=0; $i<$limit; $i++) {
+            $msg = $ch->basic_get($dlq, false);
+            if (!$msg instanceof AMQPMessage) break;
+
+            if (!$dry) {
+                $props = $msg->get_properties();
+                unset($props['expiration']);
+                $retry = new AMQPMessage($msg->getBody(), $props);
+                $ch->basic_publish($retry, '', 'inventory.retry');
             }
-            $m->ack();
-            $count++;
+
+            $msg->ack();
+            $moved++;
         }
 
+        Pulse::send('inventory','inventory.reserve.dlq','err', ['moved'=>$moved]);
+        $this->info("moved={$moved}");
+
         $ch->close(); $c->close();
-        $this->info("{$action} {$count} message(s).");
         return self::SUCCESS;
     }
 }

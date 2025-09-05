@@ -1,10 +1,10 @@
-<?php
+<?php declare(strict_types=1);
 
 namespace App\Http\Controllers;
 
 use Illuminate\Support\Facades\DB;
 
-class MetricsController
+final class MetricsController
 {
     public function __invoke()
     {
@@ -32,6 +32,6 @@ class MetricsController
         $lines[] = "orderlogix_payments_authorized {$payAuth}";
 
         return response(implode("\n", $lines)."\n", 200)
-            ->header('Content-Type','text/plain; version=0.0.4');
+            ->header('Content-Type','text/plain; version=0.0.4; charset=utf-8');
     }
 }

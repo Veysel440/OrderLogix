@@ -2,97 +2,72 @@
 
 namespace App\Console\Commands;
 
-use App\Models\Product;
-use App\Models\Reservation;
 use App\Support\Telemetry;
+use App\Support\Pulse;
+use App\Support\EventSchema;
 use App\Services\Rabbit\ConnectionFactory;
 use App\Services\Rabbit\Publisher;
 use Illuminate\Console\Command;
-use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use PhpAmqpLib\Message\AMQPMessage;
 
-class MqConsumeCompensation extends Command
+final class MqConsumeCompensation extends Command
 {
     protected $signature = 'mq:consume:compensation';
-    protected $description = 'Consumes payment.failed, releases reservations, emits inventory.released';
+    protected $description = 'On shipping.failed → emit inventory.release + payment.refund';
 
     public function handle(): int
     {
-        $q = 'payments.failed.q';
+        $q = env('SHIPPING_FAILED_QUEUE', 'shipping.failed.q');
+        $prefetch = (int) env('COMP_PREFETCH', 16);
 
-        $c  = ConnectionFactory::connect();
-        $ch = $c->channel();
-        $ch->basic_qos(null, 16, null);
-        $pub = new Publisher($ch);
+        $cShip = ConnectionFactory::connect('shipping');
+        $cInv  = ConnectionFactory::connect('inventory');
+        $cPay  = ConnectionFactory::connect('payments');
 
-        $ch->exchange_declare('payments.x','topic',false,true,false);
-        $ch->exchange_declare('inventory.x','topic',false,true,false);
-        $ch->queue_declare($q, false, true, false, false, false, new \PhpAmqpLib\Wire\AMQPTable([
-            'x-queue-type'=>'quorum',
-        ]));
-        $ch->queue_bind($q, 'payments.x', 'payment.failed');
+        $chShip = $cShip->channel(); $chShip->basic_qos(null,$prefetch,null);
+        $chInv  = $cInv->channel();
+        $chPay  = $cPay->channel();
 
-        $this->info("compensation listening on {$q}");
+        $pubInv = new Publisher($chInv);
+        $pubPay = new Publisher($chPay);
 
-        $cb = function(AMQPMessage $m) use ($pub) {
-            Telemetry::span('compensation.consume', function() use ($m, $pub) {
-                $ev   = json_decode($m->getBody(), true) ?? [];
-                $data = $ev['data'] ?? [];
+        $this->info("compensation ← {$q}");
+
+        $cb = function (AMQPMessage $m) use ($pubInv, $pubPay) {
+            Telemetry::span('compensation.consume', function () use ($m, $pubInv, $pubPay) {
+                $p = json_decode($m->getBody(), true);
+                EventSchema::validate($p); // shipping.failed
+
+                $data = $p['data'] ?? [];
                 $orderId = $data['order_id'] ?? null;
-                if (!$orderId) { $this->line('skip: no order_id'); $m->ack(); return; }
 
-                $mid = $ev['message_id'] ?? null;
-                $ins = DB::table('processed_messages')->insertOrIgnore([
-                    'message_id'=>$mid ?? (string) Str::uuid(),
-                    'consumer'=>'compensation',
-                    'processed_at'=>now(),
+                $pubInv->publish('inventory.x','inventory.release',[
+                    'type'=>'inventory.release','v'=>1,'message_id'=>(string) Str::uuid(),
+                    'occurred_at'=>now()->toISOString(),
+                    'data'=>['order_id'=>$orderId,'items'=>$data['items']??[]],
                 ]);
-                if ($ins === 0) { $this->line("dup: {$mid}"); $m->ack(); return; }
+                $pubPay->publish('payments.x','payment.refund',[
+                    'type'=>'payment.refund','v'=>1,'message_id'=>(string) Str::uuid(),
+                    'occurred_at'=>now()->toISOString(),
+                    'data'=>['order_id'=>$orderId,'reason'=>'shipping_failed'],
+                ]);
 
-                $items = [];
-                DB::transaction(function() use ($orderId, &$items) {
-                    $resList = Reservation::query()
-                        ->where('order_id', $orderId)
-                        ->where('status','RESERVED')
-                        ->lockForUpdate()
-                        ->get();
-
-                    foreach ($resList as $res) {
-                        /** @var Reservation $res */
-                        $p = Product::query()->lockForUpdate()->findOrFail($res->product_id);
-                        $p->reserved_qty = max(0, $p->reserved_qty - $res->qty);
-                        $p->save();
-
-                        $res->status = 'RELEASED';
-                        $res->save();
-
-                        $items[] = ['product_id'=>$p->id,'sku'=>$p->sku,'qty'=>$res->qty];
-                    }
-                });
-
-                if ($items) {
-                    $pub->publish('inventory.x','inventory.released',[
-                        'message_id'=>(string) Str::uuid(),
-                        'type'=>'inventory.released',
-                        'occurred_at'=>now()->toISOString(),
-                        'data'=>['order_id'=>$orderId,'items'=>$items],
-                    ], ['x-causation-id'=>$mid]);
-                    $this->line("→ inventory.released order={$orderId} items=".count($items));
-                } else {
-                    $this->line("no RESERVED rows to release for order={$orderId}");
-                }
+                Pulse::send('shipping','shipping.failed','err',['order_id'=>$orderId]);
+                Pulse::send('inventory','inventory.release','ok',['order_id'=>$orderId]);
+                Pulse::send('payments','payment.refund','ok',['order_id'=>$orderId]);
 
                 $m->ack();
-            }, [
-                'messaging.system'=>'rabbitmq',
-                'messaging.destination'=>'payments.failed.q',
-            ]);
+            }, ['messaging.system'=>'rabbitmq','messaging.destination'=>'shipping.failed.q']);
         };
 
-        $ch->basic_consume($q,'',false,false,false,false,$cb);
-        while ($ch->is_consuming()) { $ch->wait(); }
-        $ch->close(); $c->close();
+        $chShip->basic_consume($q, '', false, false, false, false, $cb);
+        while ($chShip->is_consuming()) { $chShip->wait(); }
+
+        $chShip->close(); $cShip->close();
+        $chInv->close();  $cInv->close();
+        $chPay->close();  $cPay->close();
+
         return self::SUCCESS;
     }
 }
