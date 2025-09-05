@@ -13,7 +13,7 @@ class MqDeclareShipping extends Command
 
     public function handle(): int
     {
-        $c = ConnectionFactory::connect('shipping'); // RMQ_SHIPPING_* env desteklemek istersen ekleyebilirsin
+        $c = ConnectionFactory::connect('shipping');
         $ch = $c->channel();
 
         $ch->exchange_declare('shipping.x','topic',false,true,false);

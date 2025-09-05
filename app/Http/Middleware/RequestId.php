@@ -12,13 +12,15 @@ final class RequestId
 {
     public function handle(Request $request, Closure $next): Response
     {
-        $rid = $request->headers->get('X-Request-Id') ?: Str::uuid()->toString();
+        $rid = (string) ($request->headers->get('X-Request-Id') ?: Str::ulid());
         $request->attributes->set('request_id', $rid);
+
         Log::withContext([
             'request_id' => $rid,
-            'path' => $request->path(),
-            'method' => $request->method(),
-            'ip' => $request->ip(),
+            'method'     => $request->method(),
+            'path'       => '/'.$request->path(),
+            'ip'         => $request->ip(),
+            'traceparent'=> $request->headers->get('traceparent'),
         ]);
 
         /** @var Response $resp */

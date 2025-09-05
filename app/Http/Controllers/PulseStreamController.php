@@ -11,31 +11,54 @@ final class PulseStreamController
 {
     public function __invoke(Request $r): StreamedResponse
     {
-        $retryMs = (int) $r->integer('retry', 3000);
+        $retryMs   = max(1000, (int) $r->integer('retry', 3000));
+        $heartbeat = max(5, (int) $r->integer('heartbeat', 10));
 
-        return response()->stream(function () use ($retryMs) {
-            @ob_end_flush();
-            header('Content-Type: text/event-stream');
-            header('Cache-Control: no-cache');
-            header('X-Accel-Buffering: no');
-            echo "retry: {$retryMs}\n\n"; @flush();
+        $callback = function () use ($retryMs, $heartbeat) {
+            echo "retry: {$retryMs}\n\n";
+            @ob_flush(); @flush();
 
-            $redis = Redis::connection();
-            $sub   = $redis->client();
-            $sub->psubscribe([Pulse::$channel]);
+            $conn = Redis::connection();
+            $client = $conn->client();
+
+            $client->psubscribe([Pulse::$channel]);
 
             $lastBeat = time();
-            foreach ($sub as $msg) {
-                if (!is_array($msg) || ($msg[0] ?? '') !== 'pmessage') {
-                    // heartbeat (her 10 sn)
-                    if (time() - $lastBeat >= 10) { echo "event: ping\ndata: {}\n\n"; @flush(); $lastBeat = time(); }
-                    continue;
+
+            try {
+                foreach ($client as $msg) {
+                    if (connection_aborted()) {
+                        break;
+                    }
+
+                    if (is_array($msg) && ($msg[0] ?? '') === 'pmessage') {
+                        $payload = (string) ($msg[3] ?? '{}');
+                        echo "data: {$payload}\n\n";
+                        @ob_flush(); @flush();
+                        $lastBeat = time();
+                        continue;
+                    }
+
+                    if (time() - $lastBeat >= $heartbeat) {
+                        echo "event: ping\ndata: {}\n\n";
+                        @ob_flush(); @flush();
+                        $lastBeat = time();
+                    }
                 }
-                $payload = (string) ($msg[3] ?? '{}');
-                echo "data: {$payload}\n\n";
-                @flush();
-                $lastBeat = time();
+            } catch (\Throwable $e) {
+                $err = json_encode(['error' => 'stream_ended', 'reason' => substr($e->getMessage(), 0, 200)]);
+                echo "event: error\ndata: {$err}\n\n";
+                @ob_flush(); @flush();
+            } finally {
+                try { $client->punsubscribe([Pulse::$channel]); } catch (\Throwable) {}
             }
-        });
+        };
+
+        return response()->stream($callback, 200, [
+            'Content-Type'      => 'text/event-stream; charset=utf-8',
+            'Cache-Control'     => 'no-cache, no-transform',
+            'X-Accel-Buffering' => 'no',
+            'Connection'        => 'keep-alive',
+        ]);
     }
 }

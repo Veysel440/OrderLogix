@@ -9,8 +9,10 @@ final class Pulse
 {
     public static string $channel = 'pulse.stream';
 
-    /** @param array<string,mixed> $meta */
-    public static function send(string $kind, string $name, string $status='ok', array $meta=[]): void
+    /**
+     * @param array<string,mixed> $meta
+     */
+    public static function send(string $kind, string $name, string $status = 'ok', array $meta = []): void
     {
         $evt = [
             'id'     => (string) Str::uuid(),
@@ -21,14 +23,19 @@ final class Pulse
             'meta'   => $meta,
         ];
 
-        $json = json_encode($evt, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);
-        $r = Redis::connection();
+        $json = json_encode($evt, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 
-        $r->publish(self::$channel, $json);
+        try {
+            $r = Redis::connection();
 
-        $list = env('PULSE_REDIS_LIST', 'pulse:events');
-        $max  = (int) env('PULSE_REDIS_MAX', 20000);
-        $r->lPush($list, $json);
-        $r->lTrim($list, 0, $max - 1);
+            $r->publish(self::$channel, $json);
+
+            $list = env('PULSE_REDIS_LIST', 'pulse:events');
+            $max  = max(1000, (int) env('PULSE_REDIS_MAX', 20000));
+            $r->lPush($list, $json);
+            $r->lTrim($list, 0, $max - 1);
+        } catch (\Throwable $e) {
+            logger()->warning('pulse.send failed', ['err' => $e->getMessage()]);
+        }
     }
 }

@@ -1,16 +1,57 @@
 <?php
 
 return [
-    'paths' => ['api/*', 'pulse/*', 'sanctum/csrf-cookie'],
-    'allowed_methods' => ['GET','POST','OPTIONS'],
-    'allowed_origins' => array_filter(preg_split(
-        '/\s*,\s*/',
-        env('CORS_ALLOWED_ORIGINS', 'http://localhost:5173'),
-        -1, PREG_SPLIT_NO_EMPTY
-    )),
+
+    /*
+    |--------------------------------------------------------------------------
+    | CORS Paths
+    |--------------------------------------------------------------------------
+    */
+    'paths' => [
+        'api/*',
+        'healthz',
+        'metrics',
+        'pulse/*',        // stream/events/snapshot
+        'sanctum/csrf-cookie',
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Allowed Methods
+    |--------------------------------------------------------------------------
+    */
+    'allowed_methods' => ['*'],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Allowed Origins
+    |--------------------------------------------------------------------------
+    | .env: CORS_ALLOWED_ORIGINS="http://localhost:5173,http://127.0.0.1:5173,https://orderpulse.example.com"
+    */
+    'allowed_origins' => array_values(array_filter(array_map('trim', explode(',', env('CORS_ALLOWED_ORIGINS', 'http://localhost:5173'))))),
+
     'allowed_origins_patterns' => [],
-    'allowed_headers' => ['Authorization','Content-Type','Accept','X-Request-Id','traceparent'],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Allowed & Exposed Headers
+    |--------------------------------------------------------------------------
+    */
+    'allowed_headers' => ['*'],
+
     'exposed_headers' => ['X-Request-Id'],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Max Age
+    |--------------------------------------------------------------------------
+    */
     'max_age' => 3600,
+
+    /*
+    |--------------------------------------------------------------------------
+    | Supports Credentials
+    |--------------------------------------------------------------------------
+    */
     'supports_credentials' => false,
 ];

@@ -10,10 +10,15 @@ final class PulseExportController
 {
     public function events(Request $r)
     {
-        $key = env('PULSE_REDIS_LIST','pulse:events');
-        $n   = min( (int) $r->integer('limit', 1000), 20000);
-        $raw = Redis::lrange($key, 0, $n-1) ?? [];
-        $out = array_map(static fn($x) => json_decode($x, true), $raw);
+        $key = (string) env('PULSE_REDIS_LIST', 'pulse:events');
+        $n   = max(1, min((int) $r->integer('limit', 1000), (int) env('PULSE_REDIS_MAX', 20000)));
+
+        $raw = Redis::connection()->lrange($key, 0, $n - 1) ?? [];
+        $out = [];
+        foreach ($raw as $x) {
+            $d = json_decode((string) $x, true);
+            if (is_array($d)) { $out[] = $d; }
+        }
 
         return response()->json($out);
     }
@@ -24,7 +29,7 @@ final class PulseExportController
             'ts'     => now()->toISOString(),
             'config' => [
                 'channel' => Pulse::$channel,
-                'list'    => env('PULSE_REDIS_LIST','pulse:events'),
+                'list'    => (string) env('PULSE_REDIS_LIST', 'pulse:events'),
                 'max'     => (int) env('PULSE_REDIS_MAX', 20000),
             ],
         ]);

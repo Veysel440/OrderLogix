@@ -5,19 +5,24 @@ namespace App\Console\Commands;
 use App\Services\Rabbit\ConnectionFactory;
 use Illuminate\Console\Command;
 
-class MqStats extends Command
+final class MqStats extends Command
 {
-    protected $signature = 'mq:stats {queues*}';
-    protected $description = 'Show message/consumer counts (passive declare)';
+    protected $signature = 'mq:stats {queues*} {--ctx=orders}';
+    protected $description = 'Passive declare to show message/consumer counts (per vhost via --ctx)';
 
     public function handle(): int
     {
-        $c = ConnectionFactory::connect();
-        $ch = $c->channel();
+        $ctx = (string) $this->option('ctx');
+        $c   = ConnectionFactory::connect($ctx);
+        $ch  = $c->channel();
 
         foreach ($this->argument('queues') as $q) {
-            [$name, $messages, $consumers] = $ch->queue_declare($q, true, false, false, false);
-            $this->line(sprintf('%-28s messages=%-6d consumers=%-3d', $name, $messages, $consumers));
+            try {
+                [$name, $messages, $consumers] = $ch->queue_declare($q, true, false, false, false);
+                $this->line(sprintf('[%s] %-28s messages=%-6d consumers=%-3d', $ctx, $name, $messages, $consumers));
+            } catch (\Throwable $e) {
+                $this->warn(sprintf('[%s] %s: %s', $ctx, $q, $e->getMessage()));
+            }
         }
 
         $ch->close(); $c->close();

@@ -31,11 +31,10 @@ class Kernel extends HttpKernel
             \Illuminate\View\Middleware\ShareErrorsFromSession::class,
             \App\Http\Middleware\VerifyCsrfToken::class,
             \Illuminate\Routing\Middleware\SubstituteBindings::class,
-            \App\Http\Middleware\RequestId::class,
-
         ],
 
         'api' => [
+            // RateLimiter::for('api') tanımlı (RouteServiceProvider)
             'throttle:api',
             \Illuminate\Routing\Middleware\SubstituteBindings::class,
         ],
@@ -44,11 +43,6 @@ class Kernel extends HttpKernel
     /**
      * Route middleware aliases.
      */
-
-    protected $routeMiddleware = [
-        // ...
-        'ability' => \App\Http\Middleware\RequireAbility::class,
-    ];
     protected $middlewareAliases = [
         'auth'             => \App\Http\Middleware\Authenticate::class,
         'auth.basic'       => \Illuminate\Auth\Middleware\AuthenticateWithBasicAuth::class,
@@ -60,6 +54,8 @@ class Kernel extends HttpKernel
         'throttle'         => \Illuminate\Routing\Middleware\ThrottleRequests::class,
         'verified'         => \Illuminate\Auth\Middleware\EnsureEmailIsVerified::class,
 
+        // Özel
+        'ability'          => \App\Http\Middleware\RequireAbility::class,
         'idempotency'      => \App\Http\Middleware\EnsureIdempotency::class,
     ];
 }
